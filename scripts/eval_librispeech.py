@@ -1,4 +1,5 @@
 import whisper
+from whisper.tokenizer import get_tokenizer
 from whisper.normalizers import EnglishTextNormalizer
 
 import os
@@ -8,16 +9,15 @@ import editdistance
 
 target_dir=sys.argv[1]
 model_tag = "large"
-model = whisper.load_model(model_tag)
-beam_size=5
+model = whisper.load_model(model_tag, download_root='./download')
 options = whisper.DecodingOptions(
     task='transcribe',
-    language='en',
+    language="en",
     # Sampling-related
     temperature=0.0,
     sample_len=None,  # maximum number of tokens to sample
     best_of=None,  # number of independent sample trajectories, if t>0
-    beam_size=beam_size,  # number of beams, if t==0
+    beam_size=5,  # number of beams, if t==0
     patience=None,  # patience in beam search (arxiv:2204.05424)
     # "alpha" in Google NMT
     length_penalty=None,
@@ -34,8 +34,8 @@ options = whisper.DecodingOptions(
     fp16=True,
 )
 normalizer = EnglishTextNormalizer()
-logfilename="log_{target_dir}" \
-    + f"_beam{beam_size}" if beam_size is not None and beam_size>1 else "" \
+logfilename=f"log_{target_dir}" \
+    + f"_beam{options.beam_size}" if options.beam_size is not None and options.beam_size>1 else "" \
     + ".txt"
 logfile = open(logfilename, "w")
 
@@ -68,9 +68,9 @@ def decode_audio(audiopath):
         ).to(model.device)
 
     # detect the spoken language
-    _, probs = model.detect_language(mel)
-    lang = {max(probs, key=probs.get)}
-    assert lang == {"en"}, f"Language not supported: {lang}"
+    # _, probs = model.detect_language(mel)
+    # lang = {max(probs, key=probs.get)}
+    #assert lang == {"en"}, f"Language not supported: {lang}"
     # print(f"Detected language: {max(probs, key=probs.get)}")
 
     # decode the audio
