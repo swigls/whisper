@@ -1,6 +1,11 @@
+v build subword trie  
+  v tokenizer augmentation: bpe single split
+  + tokenizer augmentation: bpe dropout
+v trie visualization (graphviz or treevizer)
+  v not int, but string
+v trie-based boosting code
+  v boosting code debug => Not because of segmentation, but word-start and capitalization
 
-+ build subword trie
-+ trie-based boosting code
+^ set biasing list (only for mestienne for 3764-168671-0018)
 
-+ set biasing list
-+ measure biasing WER
+^ measure biasing WER (only for mestienne)

@@ -1,24 +1,44 @@
 import whisper
 from whisper.tokenizer import get_tokenizer
 from whisper.normalizers import EnglishTextNormalizer
+from whisper.subword_trie import SingletonTokenizer
 
 import os
 import sys
 import editdistance
 
+from build_bpe_trie import get_bpe_trie
 
 target_dir=sys.argv[1]
+target_audio=None if len(sys.argv) < 3 else sys.argv[2]
 model_tag = "large"
+glossary_name = None #"Mestienne_0.05"
+language = "en"
+task = "transcribe"
+
 model = whisper.load_model(model_tag, download_root='./download')
+tokenizer = SingletonTokenizer()
+tokenizer.init_tokenizer(get_tokenizer(
+        model.is_multilingual,
+        num_languages=model.num_languages,
+        language=language,
+        task=task,
+        ))
+#with open(f'multilingual.vocab', 'w') as f:
+#    tokenizer.set_vocab(f.read().splitlines())
+
+normalizer = EnglishTextNormalizer()
 options = whisper.DecodingOptions(
-    task='transcribe',
-    language="en",
+    task=task,
+    language=language,
     # Sampling-related
     temperature=0.0,
     sample_len=None,  # maximum number of tokens to sample
     best_of=None,  # number of independent sample trajectories, if t>0
-    beam_size=5,  # number of beams, if t==0
+    beam_size=10,  # number of beams, if t==0
     patience=None,  # patience in beam search (arxiv:2204.05424)
+    glossary_trie=get_bpe_trie('glossary_'+glossary_name, visualize=True) \
+        if glossary_name else None,  # SubwordTrie
     # "alpha" in Google NMT
     length_penalty=None,
     #
@@ -33,11 +53,10 @@ options = whisper.DecodingOptions(
     # implementation details
     fp16=True,
 )
-normalizer = EnglishTextNormalizer()
-logfilename=f"log_{target_dir}" \
-    + f"_beam{options.beam_size}" if options.beam_size is not None and options.beam_size>1 else "" \
-    + ".txt"
-logfile = open(logfilename, "w")
+logfilename=f"log_{model_tag}_{target_dir}" \
+    + (f"_beam{options.beam_size}" if options.beam_size is not None and options.beam_size>1 else "") \
+    + (f"_glossary_{glossary_name}" if glossary_name is not None else "")
+logfile = open(logfilename, "w") if target_audio is None else open(logfilename+f'_{target_audio}', "w")
 
 def log_and_print(text):
     logfile.write(text + "\n")
@@ -82,6 +101,7 @@ def decode_audio(audiopath):
     # print the recognized text
     num_err = editdistance.eval(hyp, ref)
     num_words = len(hyp)
+    log_and_print(f'Audiofile: {audiopath.split("/")[-1].split(".")[0]}')
     log_and_print(f'REF: {ref}')
     log_and_print(f'HYP: {hyp}')
     log_and_print(f'#ERR/#WORDS = {num_err}/{num_words}')
@@ -90,9 +110,16 @@ def decode_audio(audiopath):
 if __name__ == "__main__":
     error_words = 0
     total_words = 0
-    for root, dirs, files in os.walk(f"/home/sean/speechDB/librispeech/LibriSpeech/{target_dir}"):
+    walk_root = f"/home/sean/speechDB/librispeech/LibriSpeech/{target_dir}"
+    if target_audio is not None:
+        chptr, spkr, utt = target_audio.split('.')[0].split('-')
+        walk_root = os.path.join(walk_root, f'{chptr}/{spkr}')
+    for root, dirs, files in os.walk(walk_root):
         for name in files:
             if name.endswith(".wav"):
+                if target_audio is not None:
+                    if name.replace('.wav','') != target_audio.replace('.wav',''):
+                        continue
                 result = decode_audio(os.path.join(root, name))
                 error_words += result['num_err']
                 total_words += result['num_words']
@@ -100,3 +127,4 @@ if __name__ == "__main__":
     log_and_print(f'Total Error Words: {error_words}')
     log_and_print(f'Total Words: {total_words}')
     log_and_print(f'Total WER: {error_words/total_words}')
+    #breakpoint()

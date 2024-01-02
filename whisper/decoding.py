@@ -10,6 +10,7 @@ from torch.distributions import Categorical
 from .audio import CHUNK_LENGTH
 from .tokenizer import Tokenizer, get_tokenizer
 from .utils import compression_ratio
+from .subword_trie import SubwordTrie, SubwordTrieNode, SingletonTokenizer
 
 if TYPE_CHECKING:
     from .model import Whisper
@@ -91,6 +92,7 @@ class DecodingOptions:
     best_of: Optional[int] = None  # number of independent sample trajectories, if t > 0
     beam_size: Optional[int] = None  # number of beams in beam search, if t == 0
     patience: Optional[float] = None  # patience in beam search (arxiv:2204.05424)
+    glossary_trie: Optional[SubwordTrie] = None  # glossary trie for beam search
 
     # "alpha" in Google NMT, or None for length norm, when ranking generations
     # to select which to return among the beams or best-of-N samples
@@ -305,11 +307,13 @@ class BeamSearchDecoder(TokenDecoder):
         eot: int,
         inference: Inference,
         patience: Optional[float] = None,
+        glossary_trie: Optional[SubwordTrie] = None,
     ):
         self.beam_size = beam_size
         self.eot = eot
         self.inference = inference
         self.patience = patience or 1.0
+        self.glossary_trie = glossary_trie
         self.max_candidates: int = round(beam_size * self.patience)
         self.finished_sequences = None
 
@@ -321,10 +325,20 @@ class BeamSearchDecoder(TokenDecoder):
         self.finished_sequences = None
 
     def update(
-        self, tokens: Tensor, logits: Tensor, sum_logprobs: Tensor
+        self, tokens: Tensor, logits: Tensor, sum_logprobs: Tensor,
+        trie_nodes: Optional[List[SubwordTrieNode]] = None,
     ) -> Tuple[Tensor, bool]:
+        '''
+        trie_node: (n_batch,) * SubwordTrieNode
+            (optional) trie node to traverse for glossary search
+        '''
         if tokens.shape[0] % self.beam_size != 0:
             raise ValueError(f"{tokens.shape}[0] % {self.beam_size} != 0")
+        if self.glossary_trie:
+            if trie_nodes is None:
+                raise ValueError("glossary_trie is given but trie_nodes is not given")
+            if len(trie_nodes) % self.beam_size != 0:
+                raise ValueError(f"len(trie_nodes) % {self.beam_size} != 0")
 
         n_audio = tokens.shape[0] // self.beam_size
         if self.finished_sequences is None:  # for the first update
@@ -332,17 +346,54 @@ class BeamSearchDecoder(TokenDecoder):
 
         logprobs = F.log_softmax(logits.float(), dim=-1)
         next_tokens, source_indices, finished_sequences = [], [], []
+        if self.glossary_trie:
+            next_trie_nodes = []
         for i in range(n_audio):
             scores, sources, finished = {}, {}, {}
+            if self.glossary_trie:
+                new_nodes = {}
 
             # STEP 1: calculate the cumulative log probabilities for possible candidates
             for j in range(self.beam_size):
                 idx = i * self.beam_size + j
                 prefix = tokens[idx].tolist()
-                for logprob, token in zip(*logprobs[idx].topk(self.beam_size + 1)):
+                if self.glossary_trie:
+                    prev_node = trie_nodes[idx]
+                    top1_logprob = logprobs[idx].topk(1)[0]
+                for k, (logprob, token) in enumerate(zip(*logprobs[idx].topk(self.beam_size + 1))):
                     new_logprob = (sum_logprobs[idx] + logprob).item()
                     sequence = tuple(prefix + [token.item()])
                     scores[sequence] = new_logprob
+                    if self.glossary_trie:
+                        new_node = self.glossary_trie.traverse((token.item(),), prev_node)
+                        # if True: #SingletonTokenizer.decode([token.item()]) in "mestian":
+                        #     print(f'{SingletonTokenizer.decode(sequence)} (\'{SingletonTokenizer.decode([token.item()])}\')')
+                        # if new_node is not None: # and SingletonTokenizer.decode([new_node.subword]) in "Mestian":
+                        #     print(f'{SingletonTokenizer.decode([prev_node.subword]) if prev_node else None} -> \'{SingletonTokenizer.decode([new_node.subword])}\'')
+                        #print(self.glossary_trie.root.children[0].subword)
+                        if prev_node is not None:  # not the first subword
+                            if new_node is not None:  # glossary (post) subwords
+                                #print(f'Original : {sum_logprobs[idx].item():.3f} + [{logprob.item():.3f}] = {scores[sequence]:.3f}')
+
+                                # Automatic continuing bonus (reference paper: https://arxiv.org/pdf/2210.09510.pdf)
+                                # TODO: issue: maybe bypassed because of lower/uppercase difference
+                                # TODO: potential issue: maybe bypassed because of different tokenization
+                                diff_from_top1 = top1_logprob - logprob
+                                boost_alpha = 10  # 10 in the paper (not sure)
+                                boost_beta = 0.5  # 0.5 in the paper (not sure)
+                                boost_scale = torch.sigmoid(diff_from_top1/(k+1)*boost_alpha + boost_beta)
+                                scores[sequence] += boost_scale * diff_from_top1
+                                #print(f'Continued: Original + {boost_scale.item():.3f}*({top1_logprob.item():.3f}+{-logprob.item():.3f}) = {scores[sequence].item():.3f}')
+
+                                # Manual complete bonus (experimental)
+                                # TODO: can we automatically determine complete bonus?
+                                # TODO: potential issue: complete bonus can be applied multiple times for a single glossary
+                                if new_node.stop:
+                                    scores[sequence] += new_node.complete_bonus
+                                    #print(f'Completed: Continued + {new_node.complete_bonus:.3f} = {scores[sequence].item():.3f}')
+                            else:  # disconnected, but maybe the first subword of others
+                                new_node = self.glossary_trie.traverse((token.item(),))
+                        new_nodes[sequence] = new_node
                     sources[sequence] = idx
 
             # STEP 2: rank the candidates and keep the top beam_size sequences for each audio
@@ -353,6 +404,8 @@ class BeamSearchDecoder(TokenDecoder):
                 else:
                     sum_logprobs[len(next_tokens)] = scores[sequence]
                     next_tokens.append(sequence)
+                    if self.glossary_trie:
+                        next_trie_nodes.append(new_nodes[sequence])
                     source_indices.append(sources[sequence])
 
                     saved += 1
@@ -379,6 +432,8 @@ class BeamSearchDecoder(TokenDecoder):
             len(sequences) >= self.max_candidates
             for sequences in self.finished_sequences
         )
+        if self.glossary_trie:
+            return tokens, completed, next_trie_nodes
         return tokens, completed
 
     def finalize(self, preceding_tokens: Tensor, sum_logprobs: Tensor):
@@ -545,7 +600,8 @@ class DecodingTask:
         # decoder: implements how to select the next tokens, given the autoregressive distribution
         if options.beam_size is not None:
             self.decoder = BeamSearchDecoder(
-                options.beam_size, tokenizer.eot, self.inference, options.patience
+                options.beam_size, tokenizer.eot, self.inference, options.patience,
+                options.glossary_trie,
             )
         else:
             self.decoder = GreedyDecoder(options.temperature, tokenizer.eot)
@@ -677,7 +733,8 @@ class DecodingTask:
 
         return languages, lang_probs
 
-    def _main_loop(self, audio_features: Tensor, tokens: Tensor):
+    def _main_loop(self, audio_features: Tensor, tokens: Tensor,
+                   trie_nodes: Optional[List[SubwordTrieNode]] = None):
         n_batch = tokens.shape[0]
         sum_logprobs: Tensor = torch.zeros(n_batch, device=audio_features.device)
         no_speech_probs = [np.nan] * n_batch
@@ -700,7 +757,11 @@ class DecodingTask:
                     logit_filter.apply(logits, tokens)
 
                 # expand the tokens tensor with the selected next tokens
-                tokens, completed = self.decoder.update(tokens, logits, sum_logprobs)
+                if self.options.beam_size is not None and self.options.glossary_trie:
+                    tokens, completed, trie_nodes = \
+                        self.decoder.update(tokens, logits, sum_logprobs, trie_nodes)
+                else:
+                    tokens, completed = self.decoder.update(tokens, logits, sum_logprobs)
 
                 if completed or tokens.shape[-1] > self.n_ctx:
                     break
@@ -717,6 +778,8 @@ class DecodingTask:
 
         audio_features: Tensor = self._get_audio_features(mel)  # encoder forward pass
         tokens: Tensor = torch.tensor([self.initial_tokens]).repeat(n_audio, 1)
+        trie_nodes = [None] * n_audio * self.n_group if self.options.beam_size is not None \
+            and self.options.glossary_trie else None
 
         # detect language if requested, overwriting the language token
         languages, language_probs = self._detect_language(audio_features, tokens)
@@ -734,7 +797,8 @@ class DecodingTask:
         tokens = tokens.repeat_interleave(self.n_group, dim=0).to(audio_features.device)
 
         # call the main sampling loop
-        tokens, sum_logprobs, no_speech_probs = self._main_loop(audio_features, tokens)
+        tokens, sum_logprobs, no_speech_probs = \
+            self._main_loop(audio_features, tokens, trie_nodes)
 
         # reshape the tensors to have (n_audio, n_group) as the first two dimensions
         audio_features = audio_features[:: self.n_group]
